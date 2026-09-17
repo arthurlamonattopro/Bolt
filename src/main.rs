@@ -144,6 +144,13 @@ async fn run() -> Result<()> {
         Commands::Exec { command, args, yes } => {
             handle_exec(&project_dir, &registry_client, &command, &args, yes).await?;
         }
+        Commands::Create {
+            template,
+            args,
+            yes,
+        } => {
+            handle_create(&project_dir, &registry_client, &template, &args, yes).await?;
+        }
 
         Commands::Audit {
             format,
@@ -459,6 +466,141 @@ async fn handle_exec(
     Ok(())
 }
 
+/// Transform template specifier into npm initializer package name:
+/// - `vite` -> `create-vite`
+/// - `vite@latest` -> `create-vite@latest`
+/// - `@scope` -> `@scope/create`
+/// - `@scope@latest` -> `@scope/create@latest`
+/// - `@scope/app` -> `@scope/create-app`
+/// - `@scope/app@latest` -> `@scope/create-app@latest`
+/// - `create-foo` -> `create-foo`
+/// - `@scope/create-foo` -> `@scope/create-foo`
+pub fn resolve_create_package_name(template: &str) -> String {
+    let template = template.trim();
+    if template.is_empty() {
+        return "create".to_string();
+    }
+
+    // Handle scoped template: @scope or @scope/pkg
+    if let Some(stripped) = template.strip_prefix('@') {
+        if let Some(slash_idx) = stripped.find('/') {
+            let scope = &stripped[..slash_idx];
+            let rest = &stripped[slash_idx + 1..];
+            let (pkg_name, version_tag) = if let Some(at_idx) = rest.find('@') {
+                (&rest[..at_idx], Some(&rest[at_idx..]))
+            } else {
+                (rest, None)
+            };
+
+            let target_pkg = if pkg_name.starts_with("create-") || pkg_name == "create" {
+                pkg_name.to_string()
+            } else {
+                format!("create-{}", pkg_name)
+            };
+
+            if let Some(tag) = version_tag {
+                format!("@{}/{}{}", scope, target_pkg, tag)
+            } else {
+                format!("@{}/{}", scope, target_pkg)
+            }
+        } else {
+            // Bare @scope or @scope@tag
+            let (scope, version_tag) = if let Some(at_idx) = stripped.find('@') {
+                (&stripped[..at_idx], Some(&stripped[at_idx..]))
+            } else {
+                (stripped, None)
+            };
+
+            if let Some(tag) = version_tag {
+                format!("@{}/create{}", scope, tag)
+            } else {
+                format!("@{}/create", scope)
+            }
+        }
+    } else {
+        // Unscoped: foo or foo@tag
+        let (pkg_name, version_tag) = if let Some(at_idx) = template.find('@') {
+            (&template[..at_idx], Some(&template[at_idx..]))
+        } else {
+            (template, None)
+        };
+
+        let target_pkg = if pkg_name.starts_with("create-") {
+            pkg_name.to_string()
+        } else {
+            format!("create-{}", pkg_name)
+        };
+
+        if let Some(tag) = version_tag {
+            format!("{}{}", target_pkg, tag)
+        } else {
+            target_pkg
+        }
+    }
+}
+
+async fn handle_create(
+    project_dir: &Path,
+    _registry: &RegistryClient,
+    template: &str,
+    args: &[String],
+    yes: bool,
+) -> Result<()> {
+    let package_spec = resolve_create_package_name(template);
+
+    // Extract binary name without version tag or scope for local bin check
+    let bin_name = if package_spec.starts_with('@') {
+        // e.g. @scope/create-app -> extract create-app
+        package_spec
+            .split('/')
+            .nth(1)
+            .unwrap_or(&package_spec)
+            .split('@')
+            .next()
+            .unwrap_or(&package_spec)
+    } else {
+        package_spec.split('@').next().unwrap_or(&package_spec)
+    };
+
+    let node_modules_bin = project_dir.join("node_modules").join(".bin");
+    let exists_locally = node_modules_bin.join(bin_name).exists()
+        || node_modules_bin.join(format!("{}.cmd", bin_name)).exists();
+
+    if exists_locally {
+        let status = exec_binary(project_dir, bin_name, args)?;
+        if !status.success() {
+            exit(status.code().unwrap_or(1));
+        }
+        return Ok(());
+    }
+
+    // Delegate to npx / npm exec or npm create
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("cmd.exe");
+        c.arg("/d").arg("/c").arg("npx");
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("npx");
+
+    if yes {
+        cmd.arg("-y");
+    }
+    cmd.arg(&package_spec);
+    cmd.args(args);
+    cmd.current_dir(project_dir);
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to execute initializer package '{}'", package_spec))?;
+
+    if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+
+    Ok(())
+}
 async fn handle_audit(
     project_dir: &Path,
     registry: &RegistryClient,
@@ -621,10 +763,47 @@ fn handle_why(project_dir: &Path, package: &str, json_output: bool) -> Result<()
             println!("      Requirement:  {}", reason.requirement);
             println!("      Type:         {}", reason.dep_type);
             println!("      Installed at: {}", reason.location);
+
             println!("      Version:      {}", reason.version);
             println!("      Chain:        {}", reason.chain.join(" -> "));
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_create_package_name() {
+        assert_eq!(resolve_create_package_name("vite"), "create-vite");
+        assert_eq!(
+            resolve_create_package_name("vite@latest"),
+            "create-vite@latest"
+        );
+        assert_eq!(resolve_create_package_name("create-vite"), "create-vite");
+        assert_eq!(
+            resolve_create_package_name("create-vite@1.0.0"),
+            "create-vite@1.0.0"
+        );
+        assert_eq!(resolve_create_package_name("@scope"), "@scope/create");
+        assert_eq!(
+            resolve_create_package_name("@scope@latest"),
+            "@scope/create@latest"
+        );
+        assert_eq!(
+            resolve_create_package_name("@scope/foo"),
+            "@scope/create-foo"
+        );
+        assert_eq!(
+            resolve_create_package_name("@scope/foo@latest"),
+            "@scope/create-foo@latest"
+        );
+        assert_eq!(
+            resolve_create_package_name("@scope/create-foo"),
+            "@scope/create-foo"
+        );
+    }
 }

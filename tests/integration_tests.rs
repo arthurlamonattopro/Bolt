@@ -2040,8 +2040,8 @@ async fn test_bolt_outdated_command() {
         .await;
 
     let dir = tempdir().unwrap();
+    let temp_cache = tempdir().unwrap();
     let proj_path = dir.path();
-
     let pkg_json = json!({
         "name": "outdated-test-app",
         "version": "1.0.0",
@@ -2081,6 +2081,7 @@ async fn test_bolt_outdated_command() {
     let mut cmd = AssertCmd::cargo_bin("bolt").unwrap();
     let assert = cmd
         .current_dir(proj_path)
+        .env("BOLT_CACHE_DIR", temp_cache.path())
         .arg("--registry")
         .arg(mock_server.uri())
         .arg("outdated")

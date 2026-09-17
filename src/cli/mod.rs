@@ -123,6 +123,20 @@ pub enum Commands {
         yes: bool,
     },
 
+    /// Create a new project from an initializer template (npm create / npx create-*)
+    Create {
+        /// Initializer package or template name (e.g. `vite@latest`, `@scope`, `next-app`)
+        template: String,
+
+        /// Additional arguments forwarded to the initializer
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+
+        /// Automatically proceed without confirmation prompt if package needs download
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
+
     /// Scan dependencies for known security vulnerabilities via npm Security Advisory database
     Audit {
         /// Output format: 'json' or 'table' (default)

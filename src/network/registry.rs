@@ -43,7 +43,7 @@ pub struct RegistryVersionMetadata {
     pub peer_dependencies_meta: Option<serde_json::Value>,
     #[serde(rename = "optionalDependencies", default)]
     pub optional_dependencies: Option<BTreeMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_engines")]
     pub engines: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub os: Option<Vec<String>>,
@@ -51,6 +51,36 @@ pub struct RegistryVersionMetadata {
     pub cpu: Option<Vec<String>>,
     #[serde(default)]
     pub scripts: Option<BTreeMap<String, String>>,
+}
+
+fn deserialize_engines<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut result = BTreeMap::new();
+            for (k, v) in map {
+                if let Some(s) = v.as_str() {
+                    result.insert(k, s.to_string());
+                }
+            }
+            Ok(Some(result))
+        }
+        serde_json::Value::Array(arr) => {
+            let mut result = BTreeMap::new();
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    result.insert(s.to_string(), "*".to_string());
+                }
+            }
+            Ok(Some(result))
+        }
+        _ => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

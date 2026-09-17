@@ -65,14 +65,149 @@ impl NpmConfig {
 
     /// Retrieve authentication header value if a token is configured for this registry URL
     pub fn get_auth_token_for_url(&self, url: &str) -> Option<String> {
-        for (k, v) in &self.auth_tokens {
-            if let Some(registry_part) = k.strip_suffix(":_authToken") {
-                let trimmed_part = registry_part.trim_start_matches('/').trim_end_matches('/');
-                if url.contains(trimmed_part) {
-                    return Some(format!("Bearer {}", v));
-                }
-            }
+        let request_url = url::Url::parse(url).ok()?;
+        if request_url.scheme() != "https"
+            || !request_url.username().is_empty()
+            || request_url.password().is_some()
+        {
+            return None;
         }
-        None
+
+        self.auth_tokens
+            .iter()
+            .filter_map(|(key, token)| {
+                let registry_part = key.strip_suffix(":_authToken")?;
+                if !registry_part.starts_with("//") {
+                    return None;
+                }
+                let scope = url::Url::parse(&format!("https:{registry_part}")).ok()?;
+                if scope.host_str() != request_url.host_str()
+                    || scope.port_or_known_default() != request_url.port_or_known_default()
+                    || !scope.username().is_empty()
+                    || scope.password().is_some()
+                    || scope.query().is_some()
+                    || scope.fragment().is_some()
+                {
+                    return None;
+                }
+
+                let scope_path = scope.path().trim_end_matches('/');
+                let remainder = request_url.path().strip_prefix(scope_path)?;
+                if !remainder.is_empty() && !remainder.starts_with('/') {
+                    return None;
+                }
+
+                Some((scope_path.len(), token))
+            })
+            .max_by_key(|(length, _)| *length)
+            .map(|(_, token)| format!("Bearer {token}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_tokens_require_matching_secure_scope() {
+        let mut config = NpmConfig::default();
+        config.auth_tokens.insert(
+            "//registry.example.test/packages/:_authToken".to_string(),
+            "test-token".to_string(),
+        );
+
+        for url in [
+            "https://registry.example.test/packages/pkg",
+            "https://REGISTRY.example.test:443/packages/pkg",
+        ] {
+            assert_eq!(
+                config.get_auth_token_for_url(url).as_deref(),
+                Some("Bearer test-token"),
+                "{url}"
+            );
+        }
+
+        for url in [
+            "http://registry.example.test/packages/pkg",
+            "https://other.example.test/packages/pkg",
+            "https://registry.example.test:8443/packages/pkg",
+            "https://registry.example.test/packages-other/pkg",
+            "https://registry.example.test/other/pkg",
+            "not a URL",
+        ] {
+            assert!(config.get_auth_token_for_url(url).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn auth_tokens_reject_invalid_scopes() {
+        for scope in [
+            "//:_authToken",
+            "registry.example.test/:_authToken",
+            "//registry.example.test/?query=value:_authToken",
+            "//registry.example.test/#fragment:_authToken",
+        ] {
+            let mut config = NpmConfig::default();
+            config
+                .auth_tokens
+                .insert(scope.to_string(), "test-token".to_string());
+            assert!(
+                config
+                    .get_auth_token_for_url("https://registry.example.test/packages/pkg")
+                    .is_none(),
+                "{scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_tokens_match_explicit_port_and_path_boundary() {
+        let mut config = NpmConfig::default();
+        config.auth_tokens.insert(
+            "//registry.example.test:8443/packages:_authToken".to_string(),
+            "test-token".to_string(),
+        );
+
+        for url in [
+            "https://registry.example.test:8443/packages",
+            "https://registry.example.test:8443/packages/",
+            "https://registry.example.test:8443/packages/pkg",
+        ] {
+            assert_eq!(
+                config.get_auth_token_for_url(url).as_deref(),
+                Some("Bearer test-token")
+            );
+        }
+        assert!(
+            config
+                .get_auth_token_for_url("https://registry.example.test/packages/pkg")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auth_tokens_prefer_most_specific_path() {
+        let mut config = NpmConfig::default();
+        config.auth_tokens.insert(
+            "//registry.example.test/:_authToken".to_string(),
+            "root-token".to_string(),
+        );
+        config.auth_tokens.insert(
+            "//registry.example.test/packages/:_authToken".to_string(),
+            "scoped-token".to_string(),
+        );
+
+        assert_eq!(
+            config
+                .get_auth_token_for_url("https://registry.example.test/packages/pkg")
+                .as_deref(),
+            Some("Bearer scoped-token")
+        );
+        assert_eq!(
+            config
+                .get_auth_token_for_url("https://registry.example.test/other/pkg")
+                .as_deref(),
+            Some("Bearer root-token")
+        );
     }
 }

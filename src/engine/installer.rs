@@ -1,17 +1,16 @@
-use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
-
 use super::bin_shim::create_bin_shims;
 use super::scripts::run_script;
 use crate::network::registry::RegistryClient;
 use crate::network::tarball::{extract_tarball_safe, verify_integrity};
 use crate::package::manifest::PackageJson;
 use crate::resolver::ResolvedNode;
+use anyhow::{Context, Result, anyhow};
+use futures::stream::{self, StreamExt};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 pub struct Installer {
     root_dir: PathBuf,
@@ -73,16 +72,22 @@ impl Installer {
                         })?;
                     }
                 } else {
+                    if node.resolved_url.is_empty() {
+                        return Err(anyhow!(
+                            "Empty resolved_url for package {}@{}",
+                            node.name,
+                            node.version
+                        ));
+                    }
                     let tarball_bytes =
                         reg.fetch_tarball(&node.resolved_url)
                             .await
                             .with_context(|| {
                                 format!(
-                                    "Failed to download tarball for {}@{}",
-                                    node.name, node.version
+                                    "Failed to download tarball for {}@{} from '{}'",
+                                    node.name, node.version, node.resolved_url
                                 )
                             })?;
-
                     verify_integrity(&tarball_bytes, &node.integrity).with_context(|| {
                         format!("Integrity check failed for {}@{}", node.name, node.version)
                     })?;

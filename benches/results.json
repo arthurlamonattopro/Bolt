@@ -163,5 +163,72 @@
         }
       }
     }
+  },
+  {
+    "timestamp": "2026-09-17T20:12:43.980Z",
+    "environment": {
+      "os": "Windows_NT 10.0.19044 (x64)",
+      "cpu": "AMD Ryzen 7 5700                               ",
+      "availableTools": [
+        "bolt",
+        "npm",
+        "pnpm",
+        "bun"
+      ]
+    },
+    "fixtures": {
+      "small": {
+        "cold": {
+          "name": "Cold Cache",
+          "boltMs": 315,
+          "npmMs": 1278,
+          "speedupVsNpm": "4.06x"
+        },
+        "warm": {
+          "name": "Warm Cache",
+          "boltMs": 38,
+          "npmMs": 729,
+          "speedupVsNpm": "19.37x"
+        },
+        "locked": {
+          "name": "Clean Locked (ci)",
+          "boltMs": 44,
+          "npmMs": 774,
+          "speedupVsNpm": "17.46x"
+        },
+        "noop": {
+          "name": "No-Op Install",
+          "boltMs": 38,
+          "npmMs": 701,
+          "speedupVsNpm": "18.50x"
+        }
+      },
+      "medium": {
+        "cold": {
+          "name": "Cold Cache",
+          "boltMs": 2119,
+          "npmMs": 2378,
+          "speedupVsNpm": "1.12x"
+        },
+        "warm": {
+          "name": "Warm Cache",
+          "boltMs": 312,
+          "npmMs": 1045,
+          "speedupVsNpm": "3.35x"
+        },
+        "locked": {
+          "name": "Clean Locked (ci)",
+          "boltMs": 394,
+          "npmMs": 936,
+          "speedupVsNpm": "2.38x"
+        },
+        "noop": {
+          "name": "No-Op Install",
+          "boltMs": 328,
+          "npmMs": 760,
+          "speedupVsNpm": "2.32x"
+        }
+      }
+    }
   }
 ]

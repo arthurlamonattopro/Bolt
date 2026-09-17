@@ -5,12 +5,91 @@ use node_semver::{Range, Version};
 #[derive(Debug, Clone)]
 pub struct SemverSpec {
     pub raw: String,
+    parsed_sets: Option<Vec<Vec<Range>>>,
 }
 
 impl SemverSpec {
     pub fn new(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        let parsed_sets = Self::parse_complex_range(trimmed);
         Self {
-            raw: raw.trim().to_string(),
+            raw: trimmed.to_string(),
+            parsed_sets,
+        }
+    }
+
+    fn parse_complex_range(input: &str) -> Option<Vec<Vec<Range>>> {
+        if input == "*" || input == "latest" || input.is_empty() {
+            return None;
+        }
+
+        // If the whole expression parses cleanly as a single Range:
+        if let Ok(single) = Range::parse(input) {
+            return Some(vec![vec![single]]);
+        }
+
+        let mut or_sets = Vec::new();
+        for or_part in input.split("||") {
+            let or_part = or_part.trim();
+            if or_part.is_empty() {
+                continue;
+            }
+            if let Ok(single) = Range::parse(or_part) {
+                or_sets.push(vec![single]);
+                continue;
+            }
+
+            // Tokenize space-separated comparators
+            let mut and_ranges = Vec::new();
+            let words: Vec<&str> = or_part.split_whitespace().collect();
+            let mut i = 0;
+            let mut ok = true;
+            while i < words.len() {
+                if words[i] == "-" {
+                    ok = false;
+                    break;
+                }
+                if i + 2 < words.len() && words[i + 1] == "-" {
+                    let hyphen_slice = format!("{} - {}", words[i], words[i + 2]);
+                    if let Ok(r) = Range::parse(&hyphen_slice) {
+                        and_ranges.push(r);
+                        i += 3;
+                        continue;
+                    }
+                }
+                if (words[i] == ">"
+                    || words[i] == ">="
+                    || words[i] == "<"
+                    || words[i] == "<="
+                    || words[i] == "=")
+                    && i + 1 < words.len()
+                {
+                    let combined = format!("{}{}", words[i], words[i + 1]);
+                    if let Ok(r) = Range::parse(&combined) {
+                        and_ranges.push(r);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if let Ok(r) = Range::parse(words[i]) {
+                    and_ranges.push(r);
+                    i += 1;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && !and_ranges.is_empty() {
+                or_sets.push(and_ranges);
+            } else {
+                return None;
+            }
+        }
+
+        if or_sets.is_empty() {
+            None
+        } else {
+            Some(or_sets)
         }
     }
 
@@ -21,19 +100,30 @@ impl SemverSpec {
             return true;
         }
 
+        // Direct exact match
+        if trimmed == version_str {
+            return true;
+        }
+
         let Ok(ver) = Version::parse(version_str) else {
             return false;
         };
 
-        // Try standard node-semver range
-        if let Ok(range) = Range::parse(trimmed) {
-            return ver.satisfies(&range);
+        if let Ok(raw_ver) = Version::parse(trimmed) {
+            if ver == raw_ver {
+                return true;
+            }
+        }
+
+        if let Some(sets) = &self.parsed_sets {
+            return sets
+                .iter()
+                .any(|and_group| and_group.iter().all(|r| ver.satisfies(r)));
         }
 
         // Exact match fallback
         trimmed == version_str
     }
-
     /// Pick the highest matching version from a list of version strings
     #[allow(clippy::collapsible_if)]
     pub fn select_best<'a>(&self, versions: &[&'a str]) -> Option<&'a str> {
@@ -290,5 +380,34 @@ pub fn parse_package_spec(spec: &str) -> Result<(String, String)> {
         Ok((pkg_name.to_string(), version.to_string()))
     } else {
         Ok((spec.to_string(), "latest".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gen_mapping_best() {
+        let spec = SemverSpec::new("0.4.0-beta.0");
+        let versions = vec![
+            "0.1.0",
+            "0.1.1",
+            "0.2.0",
+            "0.3.0",
+            "0.3.1",
+            "0.3.2",
+            "0.3.3",
+            "0.3.4",
+            "0.3.5",
+            "0.3.6-beta.0",
+            "0.3.6-beta.1",
+            "0.3.6",
+            "0.3.12",
+            "0.3.13",
+            "0.4.0-beta.0",
+        ];
+        assert!(spec.matches("0.4.0-beta.0"));
+        assert_eq!(spec.select_best(&versions), Some("0.4.0-beta.0"));
     }
 }
