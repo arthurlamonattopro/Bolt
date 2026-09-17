@@ -64,5 +64,38 @@
         "speedup": "13.86x"
       }
     }
+  },
+  {
+    "timestamp": "2026-09-17T18:20:12.207Z",
+    "environment": {
+      "os": "Windows_NT 10.0.19044 (x64)",
+      "cpu": "AMD Ryzen 7 5700                               "
+    },
+    "scenarios": {
+      "cold": {
+        "name": "Cold Cache",
+        "boltMs": 485,
+        "npmMs": 1259,
+        "speedup": "2.59x"
+      },
+      "warm": {
+        "name": "Warm Cache",
+        "boltMs": 44,
+        "npmMs": 672,
+        "speedup": "15.13x"
+      },
+      "locked": {
+        "name": "Clean Locked Install (ci)",
+        "boltMs": 53,
+        "npmMs": 697,
+        "speedup": "13.04x"
+      },
+      "noop": {
+        "name": "No-Op Install",
+        "boltMs": 49,
+        "npmMs": 647,
+        "speedup": "13.15x"
+      }
+    }
   }
 ]
