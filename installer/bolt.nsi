@@ -6,7 +6,6 @@
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 !include "x64.nsh"
-!include "EnvVarUpdate.nsh"
 
 ; ------------------------------------------------------------------------------
 ; General Settings
@@ -72,7 +71,9 @@ Section "Bolt CLI (required)" SEC01
   File "..\readme.md"
 
   ; Add install directory to system PATH
-  ${EnvVarUpdate} $0 "PATH" "A" "HKLM" "$INSTDIR"
+  EnVar::SetHKLM
+  EnVar::AddValue "PATH" "$INSTDIR"
+  Pop $0
 
   ; App Paths Registry (Allows running 'bolt' directly from Win+R Run Dialog)
   WriteRegStr HKLM "${PRODUCT_DIR_REGKEY}" "" "$INSTDIR\bolt.exe"
@@ -97,7 +98,9 @@ SectionEnd
 ; ------------------------------------------------------------------------------
 Section Uninstall
   ; Remove install directory from system PATH
-  ${un.EnvVarUpdate} $0 "PATH" "R" "HKLM" "$INSTDIR"
+  EnVar::SetHKLM
+  EnVar::DeleteValue "PATH" "$INSTDIR"
+  Pop $0
 
   ; Clean files and uninstaller
   Delete "$INSTDIR\uninstall.exe"
