@@ -573,7 +573,7 @@ impl Resolver {
                                 is_dev: item.is_dev,
                                 is_optional: is_peer_optional,
                                 is_peer: true,
-                                parent_path: "".to_string(), // peer dependencies auto-install at root unless nested conflict
+                                parent_path: install_path.clone(),
                                 cycle_path: next_cycle_path.clone(),
                             });
                         }
@@ -628,5 +628,391 @@ impl Resolver {
         }
 
         lock
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::registry::RegistryClient;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use serde_json::json;
+    use tar::Builder;
+    use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn create_test_tarball() -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut tar = Builder::new(&mut enc);
+            let data = br#"{"name":"pkg","version":"1.0.0"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "package/package.json", &data[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        enc.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_resolver_deep_cycle_prevention() {
+        let mock_server = MockServer::start().await;
+        let tarball = create_test_tarball();
+
+        // Package A depends on B, B depends on C, C depends on A (deep cycle)
+        let meta_a = json!({
+            "name": "pkg-a",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg-a",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/a.tgz", mock_server.uri()), "shasum": "abc" },
+                    "dependencies": { "pkg-b": "^1.0.0" }
+                }
+            }
+        });
+        let meta_b = json!({
+            "name": "pkg-b",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg-b",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/b.tgz", mock_server.uri()), "shasum": "abc" },
+                    "dependencies": { "pkg-c": "^1.0.0" }
+                }
+            }
+        });
+        let meta_c = json!({
+            "name": "pkg-c",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg-c",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/c.tgz", mock_server.uri()), "shasum": "abc" },
+                    "dependencies": { "pkg-a": "^1.0.0" }
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/pkg-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_a))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_b))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg-c"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_c))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/a.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(tarball.clone(), "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/b.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(tarball.clone(), "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/c.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tarball, "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        let reg = RegistryClient::new(
+            Some(mock_server.uri()),
+            Some(tmp.path().join("cache")),
+            None,
+        );
+        let resolver = Resolver::new(tmp.path().to_path_buf(), reg, None);
+
+        let mut manifest = PackageJson::default();
+        let mut deps = BTreeMap::new();
+        deps.insert("pkg-a".to_string(), "^1.0.0".to_string());
+        manifest.dependencies = Some(deps);
+
+        let resolved = resolver
+            .resolve_manifest(&manifest)
+            .await
+            .expect("Resolution should terminate without infinite loop");
+        assert!(resolved.contains_key("node_modules/pkg-a"));
+        assert!(resolved.contains_key("node_modules/pkg-b"));
+        assert!(resolved.contains_key("node_modules/pkg-c"));
+    }
+
+    #[tokio::test]
+    async fn test_resolver_incompatible_optional_deps_skipped() {
+        let mock_server = MockServer::start().await;
+        let tarball = create_test_tarball();
+
+        // Package with an optional dependency targeting an impossible OS
+        let meta_main = json!({
+            "name": "main-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "main-pkg",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/main.tgz", mock_server.uri()), "shasum": "abc" },
+                    "optionalDependencies": { "incompatible-native-pkg": "^1.0.0" }
+                }
+            }
+        });
+        let meta_incompatible = json!({
+            "name": "incompatible-native-pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "incompatible-native-pkg",
+                    "version": "1.0.0",
+                    "os": ["nonexistent_os_xyz_404"],
+                    "cpu": ["nonexistent_cpu_123"],
+                    "dist": { "tarball": format!("{}/tarballs/incomp.tgz", mock_server.uri()), "shasum": "abc" }
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/main-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_main))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/incompatible-native-pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_incompatible))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/main.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tarball, "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        let reg = RegistryClient::new(
+            Some(mock_server.uri()),
+            Some(tmp.path().join("cache")),
+            None,
+        );
+        let resolver = Resolver::new(tmp.path().to_path_buf(), reg, None);
+
+        let mut manifest = PackageJson::default();
+        let mut deps = BTreeMap::new();
+        deps.insert("main-pkg".to_string(), "^1.0.0".to_string());
+        manifest.dependencies = Some(deps);
+
+        let resolved = resolver
+            .resolve_manifest(&manifest)
+            .await
+            .expect("Resolution should succeed");
+        assert!(resolved.contains_key("node_modules/main-pkg"));
+        // Optional incompatible dep MUST be skipped
+        assert!(!resolved.contains_key("node_modules/incompatible-native-pkg"));
+    }
+
+    #[tokio::test]
+    async fn test_resolver_overrides_colliding_with_catalogs() {
+        let mock_server = MockServer::start().await;
+        let tarball = create_test_tarball();
+
+        let meta_foo = json!({
+            "name": "foo",
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "foo",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/foo-1.tgz", mock_server.uri()), "shasum": "abc" }
+                },
+                "2.0.0": {
+                    "name": "foo",
+                    "version": "2.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/foo-2.tgz", mock_server.uri()), "shasum": "abc" }
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/foo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_foo))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/foo-1.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(tarball.clone(), "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/foo-2.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tarball, "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        let reg = RegistryClient::new(
+            Some(mock_server.uri()),
+            Some(tmp.path().join("cache")),
+            None,
+        );
+
+        // Manifest uses catalog:default which specifies 1.0.0, but overrides specifies 2.0.0
+        let mut catalogs = BTreeMap::new();
+        let mut default_cat = BTreeMap::new();
+        default_cat.insert("foo".to_string(), "1.0.0".to_string());
+        catalogs.insert("default".to_string(), default_cat);
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("foo".to_string(), json!("2.0.0"));
+
+        let resolver = Resolver::new(tmp.path().to_path_buf(), reg, None)
+            .with_catalogs(catalogs)
+            .with_overrides(overrides);
+
+        let mut manifest = PackageJson::default();
+        let mut deps = BTreeMap::new();
+        deps.insert("foo".to_string(), "catalog:default".to_string());
+        manifest.dependencies = Some(deps);
+
+        let resolved = resolver
+            .resolve_manifest(&manifest)
+            .await
+            .expect("Resolution should succeed");
+        let foo_node = resolved
+            .get("node_modules/foo")
+            .expect("foo should be installed");
+        // Overrides MUST take precedence over the catalog specification
+        assert_eq!(foo_node.version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_resolver_peer_dependency_conflict_and_nesting() {
+        let mock_server = MockServer::start().await;
+        let tarball = create_test_tarball();
+
+        // Root has plugin-a (requires react ^17.0.0) and plugin-b (requires react ^18.0.0)
+        // and root directly depends on react 18.0.0
+        let meta_react = json!({
+            "name": "react",
+            "dist-tags": { "latest": "18.0.0" },
+            "versions": {
+                "17.0.0": {
+                    "name": "react",
+                    "version": "17.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/react-17.tgz", mock_server.uri()), "shasum": "abc" }
+                },
+                "18.0.0": {
+                    "name": "react",
+                    "version": "18.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/react-18.tgz", mock_server.uri()), "shasum": "abc" }
+                }
+            }
+        });
+
+        let meta_plugin_a = json!({
+            "name": "plugin-a",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "plugin-a",
+                    "version": "1.0.0",
+                    "dist": { "tarball": format!("{}/tarballs/plugin-a.tgz", mock_server.uri()), "shasum": "abc" },
+                    "peerDependencies": { "react": "^17.0.0" }
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/react"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_react))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/plugin-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_plugin_a))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/react-17.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(tarball.clone(), "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/react-18.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(tarball.clone(), "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/tarballs/plugin-a.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tarball, "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        let reg = RegistryClient::new(
+            Some(mock_server.uri()),
+            Some(tmp.path().join("cache")),
+            None,
+        );
+        let resolver = Resolver::new(tmp.path().to_path_buf(), reg, None);
+
+        let mut manifest = PackageJson::default();
+        let mut deps = BTreeMap::new();
+        deps.insert("react".to_string(), "18.0.0".to_string());
+        deps.insert("plugin-a".to_string(), "1.0.0".to_string());
+        manifest.dependencies = Some(deps);
+
+        let resolved = resolver
+            .resolve_manifest(&manifest)
+            .await
+            .expect("Resolution should succeed");
+        // Root has react 18
+        let root_react = resolved
+            .get("node_modules/react")
+            .expect("react installed at root");
+        assert_eq!(root_react.version, "18.0.0");
+        assert!(resolved.contains_key("node_modules/plugin-a"));
+        // Conflicting peer dependency react ^17.0.0 requested by plugin-a is nested under plugin-a
+        let nested_react = resolved
+            .get("node_modules/plugin-a/node_modules/react")
+            .expect("nested react installed");
+        assert_eq!(nested_react.version, "17.0.0");
     }
 }
