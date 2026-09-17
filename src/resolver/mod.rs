@@ -1,14 +1,15 @@
-use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use tracing::warn;
-
 use crate::network::git::fetch_git_repo;
 use crate::network::registry::{RegistryClient, RegistryVersionMetadata};
 use crate::package::lockfile::{LockPackage, PackageLock};
 use crate::package::manifest::PackageJson;
 use crate::package::platform::{is_cpu_supported, is_os_supported};
 use crate::package::semver::{SemverSpec, normalize_git_url, parse_dependency_req_with_catalogs};
+use anyhow::{Result, anyhow};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::warn;
 /// Represents a resolved package node in the dependency graph
 #[derive(Debug, Clone)]
 pub struct ResolvedNode {
@@ -182,7 +183,17 @@ impl Resolver {
         let mut installed: BTreeMap<String, ResolvedNode> = BTreeMap::new();
         let mut visited: HashSet<(String, String)> = HashSet::new();
 
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::default_spinner()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+                .template("{spinner:.green} [{elapsed_precise}] Resolving dependencies ({pos} resolved): {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        pb.enable_steady_tick(Duration::from_millis(80));
+
         while let Some(mut item) = queue.pop_front() {
+            pb.set_message(format!("{}@{}", item.dep_key, item.req));
             // Check overrides/resolutions for item.dep_key
             if let Some(override_val) = overrides.get(&item.dep_key) {
                 if let Some(override_req) = override_val.as_str() {
@@ -520,6 +531,7 @@ impl Resolver {
             };
 
             installed.insert(install_path.clone(), node);
+            pb.inc(1);
 
             if is_new {
                 if let Some(deps) = &ver_meta.dependencies {
@@ -556,7 +568,10 @@ impl Resolver {
                             .and_then(|obj| obj.get("optional"))
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-
+                        // Optional peer dependencies should not be automatically installed if unmet
+                        if is_peer_optional {
+                            continue;
+                        }
                         // If an existing installed package at top_level or in ancestry satisfies this peer dep, we don't need to reinstall/duplicate
                         let top_path = format!("node_modules/{}", dep_name);
                         let already_satisfied =
@@ -581,6 +596,7 @@ impl Resolver {
                 }
             }
         }
+        pb.finish_and_clear();
 
         Ok(installed)
     }
@@ -1014,5 +1030,71 @@ mod tests {
             .get("node_modules/plugin-a/node_modules/react")
             .expect("nested react installed");
         assert_eq!(nested_react.version, "17.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_resolver_skips_optional_peer_dependencies() {
+        let mock_server = MockServer::start().await;
+        let tarball = create_test_tarball();
+
+        // Package A has an optional peer dependency on B
+        let meta_a = json!({
+            "name": "pkg-with-opt-peer",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": {
+                "1.0.0": {
+                    "name": "pkg-with-opt-peer",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": format!("{}/pkg-with-opt-peer/-/pkg-with-opt-peer-1.0.0.tgz", mock_server.uri()),
+                        "shasum": "0000000000000000000000000000000000000000"
+                    },
+                    "peerDependencies": {
+                        "heavy-optional-peer": "^2.0.0"
+                    },
+                    "peerDependenciesMeta": {
+                        "heavy-optional-peer": {
+                            "optional": true
+                        }
+                    }
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/pkg-with-opt-peer"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(meta_a))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/pkg-with-opt-peer/-/pkg-with-opt-peer-1.0.0.tgz"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(tarball, "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let tmp = tempdir().unwrap();
+        let reg = RegistryClient::new(
+            Some(mock_server.uri()),
+            Some(tmp.path().join("cache")),
+            None,
+        );
+        let resolver = Resolver::new(tmp.path().to_path_buf(), reg, None);
+
+        let mut manifest = PackageJson::default();
+        let mut deps = BTreeMap::new();
+        deps.insert("pkg-with-opt-peer".to_string(), "1.0.0".to_string());
+        manifest.dependencies = Some(deps);
+
+        let resolved = resolver
+            .resolve_manifest(&manifest)
+            .await
+            .expect("Resolution should succeed");
+
+        assert!(resolved.contains_key("node_modules/pkg-with-opt-peer"));
+        // Optional peer dependency must not be fetched or queued
+        assert!(!resolved.contains_key("node_modules/heavy-optional-peer"));
     }
 }

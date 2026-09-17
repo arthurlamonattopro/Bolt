@@ -6,12 +6,13 @@ use crate::package::manifest::PackageJson;
 use crate::resolver::ResolvedNode;
 use anyhow::{Context, Result, anyhow};
 use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
-
 pub struct Installer {
     root_dir: PathBuf,
     registry: RegistryClient,
@@ -42,45 +43,64 @@ impl Installer {
         let root_dir = self.root_dir.clone();
         let registry = self.registry.clone();
 
-        // 1. Download/copy and extract packages concurrently
+        // 1. Download/copy and extract packages concurrently, grouped by depth so parents are extracted before children
         let mut install_items: Vec<ResolvedNode> = resolved.values().cloned().collect();
-        // Sort by install_path length/depth ascending so parent node_modules are extracted before nested ones
         install_items.sort_by_key(|n| n.install_path.matches('/').count());
 
-        let tasks = stream::iter(install_items).map(|node| {
-            let sem = semaphore.clone();
-            let root = root_dir.clone();
-            let reg = registry.clone();
-            let hardlink_mode = self.hardlink;
+        let total_items = install_items.len() as u64;
+        let pb = Arc::new(ProgressBar::new(total_items));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("#>-"),
+        );
+        pb.enable_steady_tick(Duration::from_millis(100));
 
-            tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let target_dir = root.join(&node.install_path);
-                let parent_dir = target_dir.parent().unwrap_or(&root);
-                create_dir_all_with_retry(parent_dir)?;
-                if target_dir.exists() {
-                    let _ = remove_dir_all_with_retry(&target_dir);
-                }
-                create_dir_all_with_retry(&target_dir)?;
-                if node.is_local_file {
-                    if let Some(src_path) = &node.local_source_path {
-                        copy_dir_all(src_path, &target_dir).with_context(|| {
-                            format!(
-                                "Failed to copy local package from {:?} to {:?}",
-                                src_path, target_dir
-                            )
-                        })?;
+        // Group items by depth
+        let mut depth_groups: BTreeMap<usize, Vec<ResolvedNode>> = BTreeMap::new();
+        for item in install_items {
+            let depth = item.install_path.matches('/').count();
+            depth_groups.entry(depth).or_default().push(item);
+        }
+
+        for (_depth, items) in depth_groups {
+            let tasks = stream::iter(items).map(|node| {
+                let sem = semaphore.clone();
+                let root = root_dir.clone();
+                let reg = registry.clone();
+                let hardlink_mode = self.hardlink;
+                let progress = pb.clone();
+                tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let target_dir = root.join(&node.install_path);
+                    let parent_dir = target_dir.parent().unwrap_or(&root);
+                    create_dir_all_with_retry(parent_dir)?;
+                    if target_dir.exists() {
+                        let _ = remove_dir_all_with_retry(&target_dir);
                     }
-                } else {
-                    if node.resolved_url.is_empty() {
-                        return Err(anyhow!(
-                            "Empty resolved_url for package {}@{}",
-                            node.name,
-                            node.version
-                        ));
-                    }
-                    let tarball_bytes =
-                        reg.fetch_tarball(&node.resolved_url)
+                    create_dir_all_with_retry(&target_dir)?;
+                    if node.is_local_file {
+                        if let Some(src_path) = &node.local_source_path {
+                            copy_dir_all(src_path, &target_dir).with_context(|| {
+                                format!(
+                                    "Failed to copy local package from {:?} to {:?}",
+                                    src_path, target_dir
+                                )
+                            })?;
+                        }
+                    } else {
+                        if node.resolved_url.is_empty() {
+                            return Err(anyhow!(
+                                "Empty resolved_url for package {}@{}",
+                                node.name,
+                                node.version
+                            ));
+                        }
+                        let tarball_bytes = reg
+                            .fetch_tarball(&node.resolved_url)
                             .await
                             .with_context(|| {
                                 format!(
@@ -88,52 +108,57 @@ impl Installer {
                                     node.name, node.version, node.resolved_url
                                 )
                             })?;
-                    verify_integrity(&tarball_bytes, &node.integrity).with_context(|| {
-                        format!("Integrity check failed for {}@{}", node.name, node.version)
-                    })?;
-                    if hardlink_mode {
-                        // CAS Store mode: extract into store first, then hardlink
-                        let store_dir = reg.cache_dir().join("store").join(format!(
-                            "{}@{}",
-                            node.name.replace('/', "+"),
-                            node.version
-                        ));
-                        if !store_dir.exists() {
-                            extract_tarball_safe(&tarball_bytes, &store_dir).with_context(
+                        verify_integrity(&tarball_bytes, &node.integrity).with_context(|| {
+                            format!("Integrity check failed for {}@{}", node.name, node.version)
+                        })?;
+                        if hardlink_mode {
+                            // CAS Store mode: extract into store first, then hardlink
+                            let store_dir = reg.cache_dir().join("store").join(format!(
+                                "{}@{}",
+                                node.name.replace('/', "+"),
+                                node.version
+                            ));
+                            if !store_dir.exists() {
+                                extract_tarball_safe(&tarball_bytes, &store_dir).with_context(
+                                    || {
+                                        format!(
+                                            "Failed to extract {}@{} to CAS store {:?}",
+                                            node.name, node.version, store_dir
+                                        )
+                                    },
+                                )?;
+                            }
+                            hardlink_dir_all(&store_dir, &target_dir).with_context(|| {
+                                format!(
+                                    "Failed to hardlink {}@{} from store {:?}",
+                                    node.name, node.version, store_dir
+                                )
+                            })?;
+                        } else {
+                            extract_tarball_safe(&tarball_bytes, &target_dir).with_context(
                                 || {
                                     format!(
-                                        "Failed to extract {}@{} to CAS store {:?}",
-                                        node.name, node.version, store_dir
+                                        "Failed to extract {}@{} to {:?}",
+                                        node.name, node.version, target_dir
                                     )
                                 },
                             )?;
                         }
-                        hardlink_dir_all(&store_dir, &target_dir).with_context(|| {
-                            format!(
-                                "Failed to hardlink {}@{} from store {:?}",
-                                node.name, node.version, store_dir
-                            )
-                        })?;
-                    } else {
-                        extract_tarball_safe(&tarball_bytes, &target_dir).with_context(|| {
-                            format!(
-                                "Failed to extract {}@{} to {:?}",
-                                node.name, node.version, target_dir
-                            )
-                        })?;
                     }
-                }
-                Result::<(), anyhow::Error>::Ok(())
-            })
-        });
-
-        let results = tasks
-            .buffer_unordered(self.concurrency_limit)
-            .collect::<Vec<_>>()
-            .await;
-        for res in results {
-            res.context("Join error in download task")??;
+                    progress.inc(1);
+                    progress.set_message(format!("{}@{}", node.name, node.version));
+                    Result::<(), anyhow::Error>::Ok(())
+                })
+            });
+            let results = tasks
+                .buffer_unordered(self.concurrency_limit)
+                .collect::<Vec<_>>()
+                .await;
+            for res in results {
+                res.context("Join error in download task")??;
+            }
         }
+        pb.finish_and_clear();
 
         // 2. Link binary shims in node_modules/.bin for all installed packages
         let bin_dir = self.root_dir.join("node_modules").join(".bin");
