@@ -159,6 +159,18 @@ async fn run() -> Result<()> {
             )
             .await?;
         }
+        Commands::Outdated {
+            packages,
+            json,
+            prod,
+            dev,
+        } => {
+            handle_outdated(&project_dir, &registry_client, &packages, json, prod, dev).await?;
+        }
+
+        Commands::Why { package, json } => {
+            handle_why(&project_dir, &package, json)?;
+        }
 
         Commands::Sbom { format, output } => {
             handle_sbom(&project_dir, &format, output.as_deref())?;
@@ -558,6 +570,60 @@ fn handle_sbom(project_dir: &Path, format: &str, output_file: Option<&Path>) -> 
         println!("Generated SBOM ({}) at {:?}", format, out_path);
     } else {
         println!("{}", output_content);
+    }
+
+    Ok(())
+}
+
+async fn handle_outdated(
+    project_dir: &Path,
+    registry: &RegistryClient,
+    packages: &[String],
+    json_output: bool,
+    prod: bool,
+    dev: bool,
+) -> Result<()> {
+    let outdated_map =
+        bolt::package::outdated::check_outdated(project_dir, registry, packages, prod, dev).await?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&outdated_map)?);
+    } else if outdated_map.is_empty() {
+        println!("All dependencies are up to date!");
+    } else {
+        println!(
+            "{:<25} {:<12} {:<12} {:<12} {:<20} Location",
+            "Package", "Current", "Wanted", "Latest", "Type"
+        );
+        println!("{}", "-".repeat(95));
+        for (name, info) in &outdated_map {
+            println!(
+                "{:<25} {:<12} {:<12} {:<12} {:<20} {}",
+                name, info.current, info.wanted, info.latest, info.dep_type, info.location
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_why(project_dir: &Path, package: &str, json_output: bool) -> Result<()> {
+    let why_result = bolt::package::why::explain_package(project_dir, package)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&why_result)?);
+    } else if why_result.reasons.is_empty() {
+        println!("Package '{}' is not required by any dependencies.", package);
+    } else {
+        println!("Explaining dependency '{}':", package);
+        for (i, reason) in why_result.reasons.iter().enumerate() {
+            println!("\n  #{}: Required by {}", i + 1, reason.required_by);
+            println!("      Requirement:  {}", reason.requirement);
+            println!("      Type:         {}", reason.dep_type);
+            println!("      Installed at: {}", reason.location);
+            println!("      Version:      {}", reason.version);
+            println!("      Chain:        {}", reason.chain.join(" -> "));
+        }
     }
 
     Ok(())

@@ -58,11 +58,11 @@ impl Installer {
                 let _permit = sem.acquire().await.unwrap();
                 let target_dir = root.join(&node.install_path);
                 let parent_dir = target_dir.parent().unwrap_or(&root);
-                fs::create_dir_all(parent_dir)?;
+                create_dir_all_with_retry(parent_dir)?;
                 if target_dir.exists() {
                     let _ = remove_dir_all_with_retry(&target_dir);
                 }
-                fs::create_dir_all(&target_dir)?;
+                create_dir_all_with_retry(&target_dir)?;
                 if node.is_local_file {
                     if let Some(src_path) = &node.local_source_path {
                         copy_dir_all(src_path, &target_dir).with_context(|| {
@@ -212,7 +212,23 @@ pub fn remove_dir_all_with_retry(path: &std::path::Path) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Retry filesystem file copy on Windows when files encounter sharing violations
+/// Retry directory creation on Windows when under indexing or antivirus contention
+fn create_dir_all_with_retry<P: AsRef<std::path::Path>>(path: P) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        match fs::create_dir_all(path.as_ref()) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 5 {
+                    return Err(e)
+                        .context(format!("Failed to create directory {:?}", path.as_ref()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50 * attempts));
+            }
+        }
+    }
+}
 pub fn copy_file_with_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<u64> {
     for attempt in 0..5 {
         match fs::copy(from, to) {

@@ -70,3 +70,11 @@ This document tracks completed features, capabilities, and upcoming engineering 
 ### Audit & Security
 - [x] `bolt audit` command verifying installed packages against the npm Security Advisory database.
 - [x] Software Bill of Materials (SBOM) generation (CycloneDX / SPDX JSON export).
+
+### Developer Experience & Inspection
+- [x] `bolt outdated` command comparing installed/locked packages against registry wanted and latest semver tags.
+- [x] `bolt why` / `bolt explain` command analyzing dependency trees and explaining why packages are installed (direct vs. transitive chain).
+
+### Packaging & Release Automation
+- [x] Multi-platform GitHub Actions release workflow (`.github/workflows/release.yml`) targeting Linux (x86_64, aarch64), macOS (Intel, Apple Silicon), and Windows (x86_64).
+- [x] Polished NSIS installer packaging `bolt.exe`, `readme.md`, and `LICENSE` with automated checksum generation.

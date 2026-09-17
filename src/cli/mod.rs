@@ -137,6 +137,33 @@ pub enum Commands {
         #[arg(long)]
         omit_dev: bool,
     },
+    /// Check for outdated dependencies and compare against latest registry versions
+    Outdated {
+        /// Optional package names to check (checks all dependencies if omitted)
+        packages: Vec<String>,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Check only production dependencies
+        #[arg(long)]
+        prod: bool,
+
+        /// Check only dev dependencies
+        #[arg(long)]
+        dev: bool,
+    },
+
+    /// Explain why a package is installed and print the dependency chain
+    Why {
+        /// Package name to investigate
+        package: String,
+
+        /// Output in JSON format
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Generate a Software Bill of Materials (SBOM) in CycloneDX or SPDX JSON format
     Sbom {

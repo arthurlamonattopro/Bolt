@@ -69,7 +69,7 @@ Section "Bolt CLI (required)" SEC01
   ; Executable and documentation
   File "..\target\release\bolt.exe"
   File "..\readme.md"
-
+  File "..\LICENSE"
   ; Add install directory to system PATH
   EnVar::SetHKLM
   EnVar::AddValue "PATH" "$INSTDIR"
@@ -106,6 +106,7 @@ Section Uninstall
   Delete "$INSTDIR\uninstall.exe"
   Delete "$INSTDIR\bolt.exe"
   Delete "$INSTDIR\readme.md"
+  Delete "$INSTDIR\LICENSE"
   RMDir "$INSTDIR"
 
   ; Clean registry keys

@@ -1855,3 +1855,242 @@ async fn test_bolt_sbom_generation() {
             .any(|p| p["name"] == "sample-dep")
     );
 }
+
+#[tokio::test]
+async fn test_bolt_audit_json_output() {
+    let mock_server = MockServer::start().await;
+
+    let advisory_response = json!({
+        "vuln-lib": [
+            {
+                "id": 9999,
+                "title": "Remote Code Execution",
+                "module_name": "vuln-lib",
+                "severity": "moderate",
+                "vulnerable_versions": "<2.0.0",
+                "patched_versions": ">=2.0.0",
+                "url": "https://npmjs.com/advisories/9999"
+            }
+        ]
+    });
+    Mock::given(method("POST"))
+        .and(path("/-/npm/v1/security/advisories/bulk"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(advisory_response))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let proj_path = dir.path();
+
+    let pkg_json = json!({
+        "name": "audit-json-app",
+        "version": "1.0.0"
+    });
+    fs::write(
+        proj_path.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lock_json = json!({
+        "name": "audit-json-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "audit-json-app",
+                "version": "1.0.0"
+            },
+            "node_modules/vuln-lib": {
+                "version": "1.0.0"
+            }
+        }
+    });
+    fs::write(
+        proj_path.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock_json).unwrap(),
+    )
+    .unwrap();
+
+    let mut cmd = AssertCmd::cargo_bin("bolt").unwrap();
+    let assert = cmd
+        .current_dir(proj_path)
+        .arg("--registry")
+        .arg(mock_server.uri())
+        .arg("audit")
+        .arg("--format")
+        .arg("json")
+        .arg("--audit-level")
+        .arg("high")
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["metadata"]["vulnerabilities"]["total"], 1);
+    assert!(parsed["advisories"]["vuln-lib"].is_array());
+}
+
+#[tokio::test]
+async fn test_bolt_why_command() {
+    let dir = tempdir().unwrap();
+    let proj_path = dir.path();
+
+    let pkg_json = json!({
+        "name": "why-test-app",
+        "version": "1.0.0",
+        "dependencies": {
+            "express": "^4.18.0"
+        }
+    });
+    fs::write(
+        proj_path.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lock_json = json!({
+        "name": "why-test-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "why-test-app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "express": "^4.18.0"
+                }
+            },
+            "node_modules/express": {
+                "version": "4.18.2",
+                "dependencies": {
+                    "qs": "6.11.0"
+                }
+            },
+            "node_modules/qs": {
+                "version": "6.11.0"
+            }
+        }
+    });
+    fs::write(
+        proj_path.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock_json).unwrap(),
+    )
+    .unwrap();
+
+    // Test why qs (transitive dependency)
+    let mut cmd = AssertCmd::cargo_bin("bolt").unwrap();
+    let assert = cmd
+        .current_dir(proj_path)
+        .arg("why")
+        .arg("qs")
+        .arg("--json")
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["package"], "qs");
+    assert_eq!(parsed["reasons"][0]["requiredBy"], "express@4.18.2");
+    assert_eq!(parsed["reasons"][0]["requirement"], "6.11.0");
+
+    // Test why express (direct dependency)
+    let mut cmd2 = AssertCmd::cargo_bin("bolt").unwrap();
+    let assert2 = cmd2
+        .current_dir(proj_path)
+        .arg("why")
+        .arg("express")
+        .arg("--json")
+        .assert()
+        .success();
+
+    let output2 = String::from_utf8(assert2.get_output().stdout.clone()).unwrap();
+    let parsed2: serde_json::Value = serde_json::from_str(&output2).unwrap();
+    assert_eq!(parsed2["package"], "express");
+    assert_eq!(parsed2["reasons"][0]["requirement"], "^4.18.0");
+}
+
+#[tokio::test]
+async fn test_bolt_outdated_command() {
+    let mock_server = MockServer::start().await;
+
+    let lodash_meta = json!({
+        "name": "lodash",
+        "dist-tags": { "latest": "4.17.21" },
+        "versions": {
+            "4.17.15": {
+                "name": "lodash",
+                "version": "4.17.15"
+            },
+            "4.17.21": {
+                "name": "lodash",
+                "version": "4.17.21"
+            },
+            "5.0.0": {
+                "name": "lodash",
+                "version": "5.0.0"
+            }
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/lodash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lodash_meta))
+        .mount(&mock_server)
+        .await;
+
+    let dir = tempdir().unwrap();
+    let proj_path = dir.path();
+
+    let pkg_json = json!({
+        "name": "outdated-test-app",
+        "version": "1.0.0",
+        "dependencies": {
+            "lodash": "^4.17.0"
+        }
+    });
+    fs::write(
+        proj_path.join("package.json"),
+        serde_json::to_string_pretty(&pkg_json).unwrap(),
+    )
+    .unwrap();
+
+    let lock_json = json!({
+        "name": "outdated-test-app",
+        "version": "1.0.0",
+        "lockfileVersion": 3,
+        "packages": {
+            "": {
+                "name": "outdated-test-app",
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": "^4.17.0"
+                }
+            },
+            "node_modules/lodash": {
+                "version": "4.17.15"
+            }
+        }
+    });
+    fs::write(
+        proj_path.join("package-lock.json"),
+        serde_json::to_string_pretty(&lock_json).unwrap(),
+    )
+    .unwrap();
+
+    let mut cmd = AssertCmd::cargo_bin("bolt").unwrap();
+    let assert = cmd
+        .current_dir(proj_path)
+        .arg("--registry")
+        .arg(mock_server.uri())
+        .arg("outdated")
+        .arg("--json")
+        .assert()
+        .success();
+
+    let output = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(parsed["lodash"]["current"], "4.17.15");
+    assert_eq!(parsed["lodash"]["wanted"], "4.17.21");
+    assert_eq!(parsed["lodash"]["latest"], "4.17.21");
+}
