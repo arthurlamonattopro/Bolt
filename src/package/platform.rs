@@ -89,24 +89,44 @@ mod tests {
         assert!(is_os_supported(&None));
         assert!(is_os_supported(&Some(vec![])));
 
-        let win_os = Some(vec!["win32".to_string(), "linux".to_string()]);
         #[cfg(windows)]
-        assert!(is_os_supported(&win_os));
+        {
+            let win_os = Some(vec!["win32".to_string(), "linux".to_string()]);
+            assert!(is_os_supported(&win_os));
 
-        let not_win_os = Some(vec!["!win32".to_string()]);
-        #[cfg(windows)]
-        assert!(!is_os_supported(&not_win_os));
+            let not_win_os = Some(vec!["!win32".to_string()]);
+            assert!(!is_os_supported(&not_win_os));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let win_only_os = Some(vec!["win32".to_string()]);
+            assert!(!is_os_supported(&win_only_os));
+
+            let not_win_os = Some(vec!["!win32".to_string()]);
+            assert!(is_os_supported(&not_win_os));
+        }
     }
 
     #[test]
     fn test_cpu_support() {
         assert!(is_cpu_supported(&None));
-        let x64_cpu = Some(vec!["x64".to_string()]);
         #[cfg(target_arch = "x86_64")]
-        assert!(is_cpu_supported(&x64_cpu));
+        {
+            let x64_cpu = Some(vec!["x64".to_string()]);
+            assert!(is_cpu_supported(&x64_cpu));
 
-        let not_x64 = Some(vec!["!x64".to_string()]);
-        #[cfg(target_arch = "x86_64")]
-        assert!(!is_cpu_supported(&not_x64));
+            let not_x64 = Some(vec!["!x64".to_string()]);
+            assert!(!is_cpu_supported(&not_x64));
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let x64_only = Some(vec!["x64".to_string()]);
+            assert!(!is_cpu_supported(&x64_only));
+
+            let not_x64 = Some(vec!["!x64".to_string()]);
+            assert!(is_cpu_supported(&not_x64));
+        }
     }
 }
